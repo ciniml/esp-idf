@@ -1,4 +1,5 @@
 // Copyright 2015-2017 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2018 LoBo (https://github.com/loboris)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@
 #include "sdmmc_types.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/spi_master_utils.h"
 #include "driver/sdmmc_host.h"
 
 #ifdef __cplusplus
@@ -77,6 +79,8 @@ typedef struct {
     .gpio_wp   = SDSPI_SLOT_NO_WP, \
     .dma_channel = 1 \
 }
+
+esp_err_t reinit_sdspi_dev(int slot);
 
 /**
  * @brief Initialize SD SPI driver

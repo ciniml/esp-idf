@@ -76,6 +76,7 @@ typedef enum {
     HTTP_METHOD_PUT,        /*!< HTTP PUT Method */
     HTTP_METHOD_PATCH,      /*!< HTTP PATCH Method */
     HTTP_METHOD_DELETE,     /*!< HTTP DELETE Method */
+    HTTP_METHOD_HEAD,       /*!< HTTP HEAD Method */
     HTTP_METHOD_MAX,
 } esp_http_client_method_t;
 
@@ -346,6 +347,9 @@ esp_err_t esp_http_client_cleanup(esp_http_client_handle_t client);
  */
 esp_http_client_transport_t esp_http_client_get_transport_type(esp_http_client_handle_t client);
 
+
+esp_err_t esp_http_client_perform_response(esp_http_client_handle_t client);
+int esp_http_client_process_again(esp_http_client_handle_t client);
 
 #ifdef __cplusplus
 }

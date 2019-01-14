@@ -1,4 +1,5 @@
-// Copyright 2015-2018 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+// Copyright (c) 2018 LoBo (https://github.com/loboris)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +21,7 @@ is a combination of SPI port and CS pin, plus some information about the specifi
 (timing, command/address length etc)
 
 The essence of the interface to a device is a set of queues; one per device. The idea is that to send something to a SPI
-device, you allocate a transaction descriptor. It contains some information about the transfer like the lenghth, address,
+device, you allocate a transaction descriptor. It contains some information about the transfer like the length, address,
 command etc, plus pointers to transmit and receive buffer. The address of this block gets pushed into the transmit queue.
 The SPI driver does its magic, and sends and retrieves the data eventually. The data gets written to the receive buffers,
 if needed the transaction descriptor is modified to indicate returned parameters and the entire thing goes into the return
@@ -36,6 +37,7 @@ queue and re-enabling the interrupt will trigger the interrupt again, which can 
 #include <string.h>
 #include "driver/spi_common.h"
 #include "driver/spi_master.h"
+#include "driver/spi_master_internal.h"
 #include "soc/dport_reg.h"
 #include "soc/spi_periph.h"
 #include "rom/ets_sys.h"
@@ -58,65 +60,6 @@ queue and re-enabling the interrupt will trigger the interrupt again, which can 
 #include "driver/gpio.h"
 #include "driver/periph_ctrl.h"
 #include "esp_heap_caps.h"
-
-typedef struct spi_device_t spi_device_t;
-typedef typeof(SPI1.clock) spi_clock_reg_t;
-
-#define NO_CS 3     //Number of CS pins per SPI host
-
-#ifdef CONFIG_SPI_MASTER_ISR_IN_IRAM
-#define SPI_MASTER_ISR_ATTR IRAM_ATTR
-#else
-#define SPI_MASTER_ISR_ATTR
-#endif
-
-#ifdef CONFIG_SPI_MASTER_IN_IRAM
-#define SPI_MASTER_ATTR IRAM_ATTR
-#else
-#define SPI_MASTER_ATTR
-#endif
-
-
-/// struct to hold private transaction data (like tx and rx buffer for DMA).
-typedef struct {
-    spi_transaction_t   *trans;
-    uint32_t *buffer_to_send;   //equals to tx_data, if SPI_TRANS_USE_RXDATA is applied; otherwise if original buffer wasn't in DMA-capable memory, this gets the address of a temporary buffer that is;
-                                //otherwise sets to the original buffer or NULL if no buffer is assigned.
-    uint32_t *buffer_to_rcv;    // similar to buffer_to_send
-} spi_trans_priv;
-
-typedef struct {
-    spi_device_t *device[NO_CS];
-    intr_handle_t intr;
-    spi_dev_t *hw;
-    spi_trans_priv cur_trans_buf;
-    int cur_cs;
-    int prev_cs;
-    lldesc_t *dmadesc_tx;
-    lldesc_t *dmadesc_rx;
-    uint32_t flags;
-    int dma_chan;
-    int max_transfer_sz;
-    spi_bus_config_t bus_cfg;
-#ifdef CONFIG_PM_ENABLE
-    esp_pm_lock_handle_t pm_lock;
-#endif
-} spi_host_t;
-
-typedef struct {
-    spi_clock_reg_t reg;
-    int eff_clk;
-    int dummy_num;
-    int miso_delay;
-} clock_config_t;
-
-struct spi_device_t {
-    QueueHandle_t trans_queue;
-    QueueHandle_t ret_queue;
-    spi_device_interface_config_t cfg;
-    clock_config_t clk_cfg;
-    spi_host_t *host;
-};
 
 static spi_host_t *spihost[3];
 
@@ -314,7 +257,7 @@ int spi_get_freq_limit(bool gpio_is_used, int input_delay_ns)
 */
 esp_err_t spi_bus_add_device(spi_host_device_t host, const spi_device_interface_config_t *dev_config, spi_device_handle_t *handle)
 {
-    int freecs;
+    int freecs, freehwcs=NO_HWCS;
     int apbclk=APB_CLK_FREQ;
     int eff_clk;
     int duty_cycle;
@@ -326,6 +269,13 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, const spi_device_interface_
     SPI_CHECK(spihost[host]!=NULL, "host not initialized", ESP_ERR_INVALID_STATE);
     SPI_CHECK(dev_config->spics_io_num < 0 || GPIO_IS_VALID_OUTPUT_GPIO(dev_config->spics_io_num), "spics pin invalid", ESP_ERR_INVALID_ARG);
     SPI_CHECK(dev_config->clock_speed_hz > 0, "invalid sclk speed", ESP_ERR_INVALID_ARG);
+    if (dev_config->spics_io_num >= 0) {
+        // 3 hardware handled CS are available per host, check if there is a free one
+        for (freecs=0; freecs<NO_CS; freecs++) {
+            if ((spihost[host]->device[freecs]) && (spihost[host]->device[freecs]->cfg.spics_io_num >=0)) freehwcs--;
+            SPI_CHECK(freehwcs>0, "no free hw cs pins for host", ESP_ERR_NOT_FOUND);
+        }
+    }
     for (freecs=0; freecs<NO_CS; freecs++) {
         //See if this slot is free; reserve if it is by putting a dummy pointer in the slot. We use an atomic compare&swap to make this thread-safe.
         if (__sync_bool_compare_and_swap(&spihost[host]->device[freecs], NULL, (spi_device_t *)1)) break;
@@ -378,21 +328,26 @@ Specify ``SPI_DEVICE_NO_DUMMY`` to ignore this checking. Then you can output dat
     if (dev_config->spics_io_num >= 0) {
         gpio_set_direction(dev_config->spics_io_num, GPIO_MODE_OUTPUT);
         spicommon_cs_initialize(host, dev_config->spics_io_num, freecs, !(spihost[host]->flags&SPICOMMON_BUSFLAG_NATIVE_PINS));
+        if (dev_config->flags&SPI_DEVICE_CLK_AS_CS) {
+            spihost[host]->hw->pin.master_ck_sel |= (1<<freehwcs);
+        } else {
+            spihost[host]->hw->pin.master_ck_sel &= (1<<freehwcs);
+        }
+        if (dev_config->flags&SPI_DEVICE_POSITIVE_CS) {
+            spihost[host]->hw->pin.master_cs_pol |= (1<<freehwcs);
+        } else {
+            spihost[host]->hw->pin.master_cs_pol &= (1<<freehwcs);
+        }
+        spihost[host]->hw->ctrl2.mosi_delay_mode = 0;
+        spihost[host]->hw->ctrl2.mosi_delay_num = 0;
+        ESP_LOGD(SPI_TAG, "SPI%d: New device added to CS%d, effective clock: %dkHz", host, freecs, dev->clk_cfg.eff_clk/1000);
     }
-    if (dev_config->flags&SPI_DEVICE_CLK_AS_CS) {
-        spihost[host]->hw->pin.master_ck_sel |= (1<<freecs);
-    } else {
-        spihost[host]->hw->pin.master_ck_sel &= (1<<freecs);
+    else {
+        spihost[host]->hw->pin.master_ck_sel &= (1<<(freecs&3));
+        spihost[host]->hw->pin.master_cs_pol &= (1<<(freecs&3));
+        ESP_LOGD(SPI_TAG, "SPI%d: New device added, external CS%d, effective clock: %dkHz", host, freecs, dev->clk_cfg.eff_clk/1000);
     }
-    if (dev_config->flags&SPI_DEVICE_POSITIVE_CS) {
-        spihost[host]->hw->pin.master_cs_pol |= (1<<freecs);
-    } else {
-        spihost[host]->hw->pin.master_cs_pol &= (1<<freecs);
-    }
-    spihost[host]->hw->ctrl2.mosi_delay_mode = 0;
-    spihost[host]->hw->ctrl2.mosi_delay_num = 0;
     *handle=dev;
-    ESP_LOGD(SPI_TAG, "SPI%d: New device added to CS%d, effective clock: %dkHz", host, freecs, dev->clk_cfg.eff_clk/1000);
     return ESP_OK;
 
 nomem:
@@ -410,9 +365,9 @@ esp_err_t spi_bus_remove_device(spi_device_handle_t handle)
     SPI_CHECK(handle!=NULL, "invalid handle", ESP_ERR_INVALID_ARG);
     //These checks aren't exhaustive; another thread could sneak in a transaction inbetween. These are only here to
     //catch design errors and aren't meant to be triggered during normal operation.
-    SPI_CHECK(uxQueueMessagesWaiting(handle->trans_queue)==0, "Have unfinished transactions", ESP_ERR_INVALID_STATE);
-    SPI_CHECK(handle->host->cur_cs == NO_CS || handle->host->device[handle->host->cur_cs]!=handle, "Have unfinished transactions", ESP_ERR_INVALID_STATE);
-    SPI_CHECK(uxQueueMessagesWaiting(handle->ret_queue)==0, "Have unfinished transactions", ESP_ERR_INVALID_STATE);
+    SPI_CHECK(uxQueueMessagesWaiting(handle->trans_queue)==0, "Have unfinished transactions (trans)", ESP_ERR_INVALID_STATE);
+    SPI_CHECK(handle->host->cur_cs == NO_CS || handle->host->device[handle->host->cur_cs]!=handle, "Have unfinished transactions (cs)", ESP_ERR_INVALID_STATE);
+    SPI_CHECK(uxQueueMessagesWaiting(handle->ret_queue)==0, "Have unfinished transactions (ret)", ESP_ERR_INVALID_STATE);
 
     //return 
     int spics_io_num = handle->cfg.spics_io_num;
@@ -584,6 +539,7 @@ static void SPI_MASTER_ISR_ATTR spi_intr(void *arg)
                 host->hw->pin.ck_idle_edge=1;
                 host->hw->user.ck_out_edge=0;
             }
+
             //Configure misc stuff
             host->hw->user.doutdin=(dev->cfg.flags & SPI_DEVICE_HALFDUPLEX)?0:1;
             host->hw->user.sio=(dev->cfg.flags & SPI_DEVICE_3WIRE)?1:0;
@@ -596,7 +552,8 @@ static void SPI_MASTER_ISR_ATTR spi_intr(void *arg)
             if ( host->hw->ctrl2.hold_time == 0 ) host->hw->ctrl2.hold_time = 1;
             host->hw->user.cs_hold=1;
 
-            //Configure CS pin
+             //Configure CS pin, if external cs is used, disable it
+            if (dev->cfg.spics_io_num < 0) i= -1;
             host->hw->pin.cs0_dis=(i==0)?0:1;
             host->hw->pin.cs1_dis=(i==1)?0:1;
             host->hw->pin.cs2_dis=(i==2)?0:1;
@@ -630,6 +587,7 @@ static void SPI_MASTER_ISR_ATTR spi_intr(void *arg)
             }
             host->hw->ctrl.fastrd_mode=1;
         }
+
 
         //Fill DMA descriptors
         int extra_dummy=0;

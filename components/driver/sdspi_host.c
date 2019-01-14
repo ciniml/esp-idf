@@ -1,4 +1,5 @@
 // Copyright 2015-2017 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2018 LoBo (https://github.com/loboris)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,10 +41,9 @@
 
 /// Structure containing run time configuration for a single SD slot
 typedef struct {
-    spi_device_handle_t handle; //!< SPI device handle, used for transactions
-    uint8_t gpio_cs;            //!< CS GPIO
-    uint8_t gpio_cd;            //!< Card detect GPIO, or GPIO_UNUSED
-    uint8_t gpio_wp;            //!< Write protect GPIO, or GPIO_UNUSED
+    exspi_device_handle_t spidev; //!< ext SPI device handle, used for transactions
+    uint8_t gpio_cd;              //!< Card detect GPIO, or GPIO_UNUSED
+    uint8_t gpio_wp;              //!< Write protect GPIO, or GPIO_UNUSED
     /// Set to 1 if the higher layer has asked the card to enable CRC checks
     uint8_t data_crc_enabled : 1;
     /// Number of transactions in 'transactions' array which are in use
@@ -72,18 +72,21 @@ static esp_err_t poll_cmd_response(int slot, sdspi_hw_cmd_t *cmd);
 /// A few helper functions
 
 /// Set CS high for given slot
+//---------------------------
 static void cs_high(int slot)
 {
-    gpio_set_level(s_slots[slot].gpio_cs, 1);
+    spi_device_deselect(&s_slots[slot].spidev);
 }
 
 /// Set CS low for given slot
+//--------------------------
 static void cs_low(int slot)
 {
-    gpio_set_level(s_slots[slot].gpio_cs, 0);
+    spi_device_select(&s_slots[slot].spidev, 0);
 }
 
 /// Return true if WP pin is configured and is low
+//----------------------------------------
 static bool card_write_protected(int slot)
 {
     if (s_slots[slot].gpio_wp == GPIO_UNUSED) {
@@ -93,6 +96,7 @@ static bool card_write_protected(int slot)
 }
 
 /// Return true if CD pin is configured and is high
+//--------------------------------
 static bool card_missing(int slot)
 {
     if (s_slots[slot].gpio_cd == GPIO_UNUSED) {
@@ -102,21 +106,25 @@ static bool card_missing(int slot)
 }
 
 /// Check if slot number is within bounds
+//---------------------------------
 static bool is_valid_slot(int slot)
 {
     return slot == VSPI_HOST || slot == HSPI_HOST;
 }
 
+//---------------------------------------------
 static spi_device_handle_t spi_handle(int slot)
 {
-    return s_slots[slot].handle;
+    return s_slots[slot].spidev.handle;
 }
 
+//---------------------------------------
 static bool is_slot_initialized(int slot)
 {
     return spi_handle(slot) != NULL;
 }
 
+//------------------------------------
 static bool data_crc_enabled(int slot)
 {
     return s_slots[slot].data_crc_enabled;
@@ -124,6 +132,7 @@ static bool data_crc_enabled(int slot)
 
 /// Get pointer to a block of DMA memory, allocate if necessary.
 /// This is used if the application provided buffer is not in DMA capable memory.
+//---------------------------------------------------------
 static esp_err_t get_block_buf(int slot, uint8_t** out_buf)
 {
     if (s_slots[slot].block_buf == NULL) {
@@ -136,6 +145,7 @@ static esp_err_t get_block_buf(int slot, uint8_t** out_buf)
     return ESP_OK;
 }
 
+//-------------------------------------------------
 static spi_transaction_t* get_transaction(int slot)
 {
     size_t used_transaction_count = s_slots[slot].used_transaction_count;
@@ -145,11 +155,13 @@ static spi_transaction_t* get_transaction(int slot)
     return ret;
 }
 
+//---------------------------------------
 static void release_transaction(int slot)
 {
     --s_slots[slot].used_transaction_count;
 }
 
+//-----------------------------------------
 static void wait_for_transactions(int slot)
 {
     size_t used_transaction_count = s_slots[slot].used_transaction_count;
@@ -162,8 +174,13 @@ static void wait_for_transactions(int slot)
 
 /// Clock out one byte (CS has to be high) to make the card release MISO
 /// (clocking one bit would work as well, but that triggers a bug in SPI DMA)
+//-------------------------------
 static void release_bus(int slot)
 {
+    ESP_LOGV(TAG, "RELEASE_BUS");
+
+    cs_low(slot);
+    cs_high(slot);
     spi_transaction_t t = {
         .flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA,
         .length = 8,
@@ -174,8 +191,13 @@ static void release_bus(int slot)
 }
 
 /// Clock out 80 cycles (10 bytes) before GO_IDLE command
+//------------------------------------
 static void go_idle_clockout(int slot)
 {
+    ESP_LOGV(TAG, "GO_IDLE_CLOCK");
+
+    cs_low(slot);
+    cs_high(slot);
     //actually we need 10, declare 12 to meet requirement of RXDMA
     uint8_t data[12];
     memset(data, 0xff, sizeof(data));
@@ -190,57 +212,98 @@ static void go_idle_clockout(int slot)
 
 
 /// Return true if the pointer can be used for DMA
+//---------------------------------------------
 static bool ptr_dma_compatible(const void* ptr)
 {
     return (uintptr_t) ptr >= 0x3FFAE000 &&
            (uintptr_t) ptr < 0x40000000;
 }
 
+/*
+ * Set the spi clock according to pre-calculated register value.
+ */
+//--------------------------------------------------------------------
+static inline void spi_set_clock(spi_dev_t *hw, spi_clock_reg_t reg) {
+    hw->clock.val = reg.val;
+}
+
 /**
- * Initialize SPI device. Used to change clock speed.
+ * Initialize SPI device or change clock speed.
  * @param slot  SPI host number
  * @param clock_speed_hz  clock speed, Hz
  * @return ESP_OK on success
  */
+//---------------------------------------------------------
 static esp_err_t init_spi_dev(int slot, int clock_speed_hz)
 {
-    if (spi_handle(slot)) {
-        // Reinitializing
-        spi_bus_remove_device(spi_handle(slot));
-        s_slots[slot].handle = NULL;
+    if (s_slots[slot].spidev.curr_clock != clock_speed_hz) {
+        ESP_LOGD(TAG, "Change clock %d -> %d", s_slots[slot].spidev.curr_clock, clock_speed_hz);
+        spi_device_handle_t handle = s_slots[slot].spidev.handle;
+        spi_host_t *host=(spi_host_t*)handle->host;
+
+        int apbclk=APB_CLK_FREQ;
+        handle->clk_cfg.eff_clk = spi_cal_clock(apbclk, clock_speed_hz, handle->cfg.duty_cycle_pos, (uint32_t*)&handle->clk_cfg.reg);
+        spi_set_clock(host->hw, handle->clk_cfg.reg);
+        s_slots[slot].spidev.curr_clock = clock_speed_hz;
     }
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = clock_speed_hz,
-        .mode = 0,
-        // For SD cards, CS must stay low during the whole read/write operation,
-        // rather than a single SPI transaction.
-        .spics_io_num = -1,
-        .queue_size = SDSPI_TRANSACTION_COUNT,
-    };
-    return spi_bus_add_device((spi_host_device_t) slot, &devcfg, &s_slots[slot].handle);
+    return ESP_OK;
 }
 
+//-------------------------
 esp_err_t sdspi_host_init()
 {
     return ESP_OK;
 }
 
+//---------------------------
 esp_err_t sdspi_host_deinit()
 {
     for (size_t i = 0; i < sizeof(s_slots)/sizeof(s_slots[0]); ++i) {
-        if (s_slots[i].handle) {
-            spi_bus_remove_device(s_slots[i].handle);
+        if (s_slots[i].spidev.handle) {
+            remove_extspi_device(&s_slots[i].spidev);
             free(s_slots[i].block_buf);
             s_slots[i].block_buf = NULL;
             free(s_slots[i].transactions);
             s_slots[i].transactions = NULL;
-            spi_bus_free((spi_host_device_t) i);
-            s_slots[i].handle = NULL;
         }
     }
     return ESP_OK;
 }
 
+//----------------------------------
+esp_err_t reinit_sdspi_dev(int slot)
+{
+    if (s_slots[slot].spidev.handle) {
+        // DeInit SPI bus
+        esp_err_t ret = spi_bus_remove_device(s_slots[slot].spidev.handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Select: Error Removing sdspi device from bus %d", s_slots[slot].spidev.spihost);
+            return ret;
+        }
+        s_slots[slot].spidev.handle = NULL;
+
+        // Free the spi bus
+        spi_bus_free((spi_host_device_t) s_slots[slot].spidev.spihost);
+
+        // ReInitialize SPI bus
+        ret = spi_bus_initialize(s_slots[slot].spidev.spihost, s_slots[slot].spidev.buscfg, s_slots[slot].spidev.dma_channel);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Select: Error ReInitializing spi bus %d", s_slots[slot].spidev.spihost);
+            return ret;
+        }
+        // Add device
+        ret = spi_bus_add_device(s_slots[slot].spidev.spihost, &s_slots[slot].spidev.devcfg, &s_slots[slot].spidev.handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Select: Error ReAdding sdspi device to bus %d", s_slots[slot].spidev.spihost);
+            s_slots[slot].spidev.handle = NULL;
+            return ret;
+        }
+        init_spi_dev(slot, s_slots[slot].spidev.curr_clock);
+    }
+    return ESP_OK;
+}
+
+//------------------------------------------------------------
 esp_err_t sdspi_host_set_card_clk(int slot, uint32_t freq_khz)
 {
     if (!is_valid_slot(slot)) {
@@ -253,6 +316,7 @@ esp_err_t sdspi_host_set_card_clk(int slot, uint32_t freq_khz)
     return init_spi_dev(slot, freq_khz * 1000);
 }
 
+//==============================================================================
 esp_err_t sdspi_host_init_slot(int slot, const sdspi_slot_config_t* slot_config)
 {
     ESP_LOGD(TAG, "%s: SPI%d miso=%d mosi=%d sck=%d cs=%d cd=%d wp=%d, dma_ch=%d",
@@ -262,52 +326,77 @@ esp_err_t sdspi_host_init_slot(int slot, const sdspi_slot_config_t* slot_config)
             slot_config->gpio_cd, slot_config->gpio_wp,
             slot_config->dma_channel);
 
-    spi_host_device_t host = (spi_host_device_t) slot;
     if (!is_valid_slot(slot)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    spi_bus_config_t buscfg = {
-        .miso_io_num = slot_config->gpio_miso,
-        .mosi_io_num = slot_config->gpio_mosi,
-        .sclk_io_num = slot_config->gpio_sck,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1
-    };
-
-    // Initialize SPI bus
-    esp_err_t ret = spi_bus_initialize((spi_host_device_t)slot, &buscfg,
-            slot_config->dma_channel);
-    if (ret != ESP_OK) {
-        ESP_LOGD(TAG, "spi_bus_initialize failed with rc=0x%x", ret);
-        return ret;
+    // Check if requested slot is uded by another device
+    int used_spi = spi_host_not_used_by_sdspi();
+    if (used_spi != 0) {
+        if (used_spi == (HSPI_HOST | VSPI_HOST)) {
+            // all slots used
+            ESP_LOGE(TAG, "Error configuring spi bus, no free slots");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (used_spi == HSPI_HOST) slot = VSPI_HOST;
+        else if (used_spi == VSPI_HOST) slot = HSPI_HOST;
+        else return ESP_ERR_INVALID_ARG;
+        ESP_LOGW(TAG, "spi bus changed (%d -> %d)", used_spi, slot);
     }
 
-    // Attach the SD card to the SPI bus
-    ret = init_spi_dev(slot, SDMMC_FREQ_PROBING * 1000);
-    if (ret != ESP_OK) {
-        ESP_LOGD(TAG, "spi_bus_add_device failed with rc=0x%x", ret);
-        spi_bus_free(host);
-        return ret;
+    // Configure the spi bus
+    s_slots[slot].spidev.buscfg = SPIbus_configs[slot];
+    if (s_slots[slot].spidev.buscfg == NULL) {
+        ESP_LOGE(TAG, "spi bus %d not available ", slot);
+        return ESP_ERR_INVALID_ARG;
     }
+
+    s_slots[slot].spidev.buscfg->miso_io_num = slot_config->gpio_miso;
+    s_slots[slot].spidev.buscfg->mosi_io_num = slot_config->gpio_mosi;
+    s_slots[slot].spidev.buscfg->sclk_io_num = slot_config->gpio_sck;
+    s_slots[slot].spidev.buscfg->quadwp_io_num = -1;
+    s_slots[slot].spidev.buscfg->quadhd_io_num = -1;
+
+    // Configure the spi device
+    s_slots[slot].spidev.devcfg.clock_speed_hz = SDMMC_FREQ_PROBING * 1000;
+    s_slots[slot].spidev.devcfg.mode = 0;
+    // For SD cards, CS must stay low during the whole read/write operation,
+    // rather than a single SPI transaction, so we use external CS.
+    s_slots[slot].spidev.devcfg.spics_io_num = -1,
+    s_slots[slot].spidev.devcfg.queue_size = SDSPI_TRANSACTION_COUNT,
+
+    s_slots[slot].spidev.dma_channel = slot_config->dma_channel;
+    s_slots[slot].spidev.curr_clock = SDMMC_FREQ_PROBING * 1000;
+    s_slots[slot].spidev.spihost = slot;
+    s_slots[slot].spidev.handle = NULL;
+    s_slots[slot].spidev.dc = SDSPI_HOST_ID;
+	s_slots[slot].spidev.selected = 0;
+
+    esp_err_t ret = check_spi_host(&s_slots[slot].spidev);
+    if (ret != 1) {
+        // Other spi host uses different pins
+        ESP_LOGE(TAG, "spi bus already used with different configuration (%d)", slot);
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Initialize the spi bus and add the device
+    ret = add_extspi_device(&s_slots[slot].spidev);
+    if (ret != ESP_OK) return ret;
 
     // Configure CS pin
-    s_slots[slot].gpio_cs = (uint8_t) slot_config->gpio_cs;
+    s_slots[slot].spidev.cs = (uint8_t) slot_config->gpio_cs;
     gpio_config_t io_conf = {
         .intr_type = GPIO_PIN_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
         .pin_bit_mask = 1LL << slot_config->gpio_cs,
     };
-
     ret = gpio_config(&io_conf);
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "gpio_config (CS) failed with rc=0x%x", ret);
-        spi_bus_remove_device(spi_handle(slot));
-        s_slots[slot].handle = NULL;
-        spi_bus_free(host);
+        remove_extspi_device(&s_slots[slot].spidev);
         return ret;
     }
-    cs_high(slot);
+    // set the CS high;
+    gpio_set_level(s_slots[slot].spidev.cs, 1);
 
     // Configure CD and WP pins
     io_conf = (gpio_config_t) {
@@ -334,25 +423,21 @@ esp_err_t sdspi_host_init_slot(int slot, const sdspi_slot_config_t* slot_config)
         ret = gpio_config(&io_conf);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "gpio_config (CD/WP) failed with rc=0x%x", ret);
-            spi_bus_remove_device(spi_handle(slot));
-            s_slots[slot].handle = NULL;
-            spi_bus_free(host);
+            remove_extspi_device(&s_slots[slot].spidev);
             return ret;
         }
     }
 
     s_slots[slot].transactions = calloc(SDSPI_TRANSACTION_COUNT, sizeof(spi_transaction_t));
     if (s_slots[slot].transactions == NULL) {
-        spi_bus_remove_device(spi_handle(slot));
-        s_slots[slot].handle = NULL;
-        spi_bus_free(host);
+        remove_extspi_device(&s_slots[slot].spidev);
         return ESP_ERR_NO_MEM;
     }
 
     return ESP_OK;
 }
 
-
+//---------------------------------------------------------------------------
 esp_err_t sdspi_host_start_command(int slot, sdspi_hw_cmd_t *cmd, void *data,
                                    uint32_t data_size, int flags)
 {
@@ -376,6 +461,7 @@ esp_err_t sdspi_host_start_command(int slot, sdspi_hw_cmd_t *cmd, void *data,
 
     // For CMD0, clock out 80 cycles to help the card enter idle state,
     // *before* CS is asserted.
+    release_bus(slot);
     if (cmd_index == MMC_GO_IDLE_STATE) {
         go_idle_clockout(slot);
     }
@@ -407,6 +493,7 @@ esp_err_t sdspi_host_start_command(int slot, sdspi_hw_cmd_t *cmd, void *data,
     return ret;
 }
 
+//------------------------------------------------------------------------------
 static esp_err_t start_command_default(int slot, int flags, sdspi_hw_cmd_t *cmd)
 {
     size_t cmd_size = SDSPI_CMD_R1_SIZE;
@@ -449,6 +536,7 @@ static esp_err_t start_command_default(int slot, int flags, sdspi_hw_cmd_t *cmd)
 }
 
 // Wait until MISO goes high
+//------------------------------------------------------------------------
 static esp_err_t poll_busy(int slot, spi_transaction_t* t, int timeout_ms)
 {
     uint8_t t_rx;
@@ -479,6 +567,7 @@ static esp_err_t poll_busy(int slot, spi_transaction_t* t, int timeout_ms)
 }
 
 // Wait for response token
+//----------------------------------------------------------------------------------
 static esp_err_t poll_response_token(int slot, spi_transaction_t* t, int timeout_ms)
 {
     uint8_t t_rx;
@@ -514,6 +603,7 @@ static esp_err_t poll_response_token(int slot, spi_transaction_t* t, int timeout
 // Wait for data token, reading 8 bytes at a time.
 // If the token is found, write all subsequent bytes to extra_ptr,
 // and store the number of bytes written to extra_size.
+//--------------------------------------------------------------
 static esp_err_t poll_data_token(int slot, spi_transaction_t* t,
         uint8_t* extra_ptr, size_t* extra_size, int timeout_ms)
 {
@@ -550,10 +640,11 @@ static esp_err_t poll_data_token(int slot, spi_transaction_t* t,
             return ESP_OK;
         }
     } while (esp_timer_get_time() < t_end);
-    ESP_LOGD(TAG, "%s: timeout", __func__);
+    ESP_LOGD(TAG, "%s: timeout (%d)", __func__, timeout_ms);
     return ESP_ERR_TIMEOUT;
 }
 
+//---------------------------------------------------------------
 static esp_err_t poll_cmd_response(int slot, sdspi_hw_cmd_t *cmd)
 {
     int response_delay_bytes = SDSPI_RESPONSE_MAX_DELAY;
@@ -577,7 +668,6 @@ static esp_err_t poll_cmd_response(int slot, sdspi_hw_cmd_t *cmd)
     }
     return ESP_OK;
 }
-
 
 /**
  * Receiving one or more blocks of data happens as follows:
@@ -620,6 +710,7 @@ static esp_err_t poll_cmd_response(int slot, sdspi_hw_cmd_t *cmd)
  * Further speedup is possible by pipelining transfers and CRC checks, at an
  * expense of one extra temporary buffer.
  */
+//-----------------------------------------------------------------------
 static esp_err_t start_command_read_blocks(int slot, sdspi_hw_cmd_t *cmd,
         uint8_t *data, uint32_t rx_length)
 {
@@ -757,6 +848,7 @@ static esp_err_t start_command_read_blocks(int slot, sdspi_hw_cmd_t *cmd,
     return ESP_OK;
 }
 
+//------------------------------------------------------------------------
 static esp_err_t start_command_write_blocks(int slot, sdspi_hw_cmd_t *cmd,
         const uint8_t *data, uint32_t tx_length)
 {

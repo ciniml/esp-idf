@@ -32,10 +32,16 @@
 #include "rom/spi_flash.h"
 #include "spiffs_api.h"
 
-#ifdef CONFIG_SPIFFS_USE_MTIME
+#if defined (CONFIG_SPIFFS_USE_MTIME) && defined (CONFIG_SPIFFS_USE_DIR)
+_Static_assert(CONFIG_SPIFFS_META_LENGTH >= sizeof(time_t)+sizeof(uint8_t),
+        "SPIFFS_META_LENGTH size should be >= sizeof(time_t)+sizeof(uint8_t)");
+#elif defined (CONFIG_SPIFFS_USE_MTIME)
 _Static_assert(CONFIG_SPIFFS_META_LENGTH >= sizeof(time_t),
         "SPIFFS_META_LENGTH size should be >= sizeof(time_t)");
-#endif //CONFIG_SPIFFS_USE_MTIME
+#elif defined (CONFIG_SPIFFS_USE_DIR)
+_Static_assert(CONFIG_SPIFFS_META_LENGTH >= sizeof(uint8_t),
+        "SPIFFS_META_LENGTH size should be >= sizeof(uint8_t)");
+#endif
 
 /**
  * @brief SPIFFS DIR structure
@@ -47,6 +53,20 @@ typedef struct {
     long offset;        /*!< Offset of the current dirent */
     char path[SPIFFS_OBJ_NAME_LEN]; /*!< Requested directory name */
 } vfs_spiffs_dir_t;
+
+#if defined (CONFIG_SPIFFS_USE_MTIME) || defined (CONFIG_SPIFFS_USE_DIR)
+/**
+ * @brief SPIFFS metadata structure
+ */
+typedef struct {
+#ifdef CONFIG_SPIFFS_USE_MTIME
+    time_t mtime;   /*!< file modification time */
+#endif
+#ifdef CONFIG_SPIFFS_USE_DIR
+    uint8_t type;   /*!< file type */
+#endif
+} __attribute__((packed, aligned(1))) vfs_spiffs_meta_t;
+#endif
 
 static int vfs_spiffs_open(void* ctx, const char * path, int flags, int mode);
 static ssize_t vfs_spiffs_write(void* ctx, int fd, const void * data, size_t size);
@@ -67,7 +87,7 @@ static long vfs_spiffs_telldir(void* ctx, DIR* pdir);
 static void vfs_spiffs_seekdir(void* ctx, DIR* pdir, long offset);
 static int vfs_spiffs_mkdir(void* ctx, const char* name, mode_t mode);
 static int vfs_spiffs_rmdir(void* ctx, const char* name);
-static void vfs_spiffs_update_mtime(spiffs *fs, spiffs_file f);
+static void vfs_spiffs_update_meta(spiffs *fs, spiffs_file f, uint8_t type);
 static time_t vfs_spiffs_get_mtime(const spiffs_stat* s);
 
 static esp_spiffs_t * _efs[CONFIG_SPIFFS_MAX_PARTITIONS];
@@ -452,8 +472,25 @@ static int vfs_spiffs_open(void* ctx, const char * path, int flags, int mode)
         SPIFFS_clearerr(efs->fs);
         return -1;
     }
+#ifdef CONFIG_SPIFFS_USE_DIR
+    spiffs_stat s;
+    int ret = SPIFFS_fstat(efs->fs, fd, &s);
+    if (ret == SPIFFS_OK) {
+        vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+        if (meta->type == SPIFFS_TYPE_DIR) {
+            // It is directory, cannot be opened
+            errno = EISDIR;
+            ret = SPIFFS_close(efs->fs, fd);
+            if (ret < 0) {
+                errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+                SPIFFS_clearerr(efs->fs);
+            }
+            return -1;
+        }
+    }
+#endif
     if (!(spiffs_flags & SPIFFS_RDONLY)) {
-        vfs_spiffs_update_mtime(efs->fs, fd);
+        vfs_spiffs_update_meta(efs->fs, fd, SPIFFS_TYPE_FILE);
     }
     return fd;
 }
@@ -518,7 +555,13 @@ static int vfs_spiffs_fstat(void* ctx, int fd, struct stat * st)
         return -1;
     }
     st->st_size = s.size;
+#ifdef CONFIG_SPIFFS_USE_DIR
+    vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+    if (meta->type == SPIFFS_TYPE_DIR) st->st_mode = S_IFDIR;
+    else st->st_mode = S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG;
+#else
     st->st_mode = S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG;
+#endif
     st->st_mtime = vfs_spiffs_get_mtime(&s);
     st->st_atime = 0;
     st->st_ctime = 0;
@@ -539,8 +582,14 @@ static int vfs_spiffs_stat(void* ctx, const char * path, struct stat * st)
     }
 
     st->st_size = s.size;
+#ifdef CONFIG_SPIFFS_USE_DIR
+    vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+    if (meta->type == SPIFFS_TYPE_DIR) st->st_mode = S_IFDIR;
+    else st->st_mode = S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG;
+#else
     st->st_mode = S_IRWXU | S_IRWXG | S_IRWXO;
     st->st_mode |= (s.type == SPIFFS_TYPE_DIR)?S_IFDIR:S_IFREG;
+#endif
     st->st_mtime = vfs_spiffs_get_mtime(&s);
     st->st_atime = 0;
     st->st_ctime = 0;
@@ -565,6 +614,21 @@ static int vfs_spiffs_unlink(void* ctx, const char *path)
 {
     assert(path);
     esp_spiffs_t * efs = (esp_spiffs_t *)ctx;
+#ifdef CONFIG_SPIFFS_USE_DIR
+    spiffs_stat s;
+    off_t ret = SPIFFS_stat(efs->fs, path, &s);
+    if (ret < 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        return -1;
+    }
+    vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+    if (meta->type == SPIFFS_TYPE_DIR) {
+        // Directory cannot be unliked (removed)
+        errno = EISDIR;
+        return -1;
+    }
+#endif
     int res = SPIFFS_remove(efs->fs, path);
     if (res < 0) {
         errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
@@ -577,6 +641,22 @@ static int vfs_spiffs_unlink(void* ctx, const char *path)
 static DIR* vfs_spiffs_opendir(void* ctx, const char* name)
 {
     assert(name);
+#ifdef CONFIG_SPIFFS_USE_DIR
+    if (strcmp(name, "/") != 0) {
+        // If not on root, check if path exists and is a directory
+        struct stat st;
+        if (vfs_spiffs_stat(ctx, name, &st)) {
+            // Not found
+            errno = ENOENT;
+            return NULL;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            // Not a directory, cannot open
+            errno = ENOTDIR;
+            return NULL;
+        }
+    }
+#endif
     esp_spiffs_t * efs = (esp_spiffs_t *)ctx;
     vfs_spiffs_dir_t * dir = calloc(1, sizeof(vfs_spiffs_dir_t));
     if (!dir) {
@@ -613,7 +693,8 @@ static struct dirent* vfs_spiffs_readdir(void* ctx, DIR* pdir)
 {
     assert(pdir);
     vfs_spiffs_dir_t * dir = (vfs_spiffs_dir_t *)pdir;
-    struct dirent* out_dirent;
+    static struct dirent* out_dirent;
+
     int err = vfs_spiffs_readdir_r(ctx, pdir, &dir->e, &out_dirent);
     if (err != 0) {
         errno = err;
@@ -629,30 +710,71 @@ static int vfs_spiffs_readdir_r(void* ctx, DIR* pdir, struct dirent* entry,
     esp_spiffs_t * efs = (esp_spiffs_t *)ctx;
     vfs_spiffs_dir_t * dir = (vfs_spiffs_dir_t *)pdir;
     struct spiffs_dirent out;
-    size_t plen;
-    char * item_name;
-    do {
-        if (SPIFFS_readdir(&dir->d, &out) == 0) {
-            errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
-            SPIFFS_clearerr(efs->fs);
-            if (!errno) {
-                *out_dirent = NULL;
-            }
-            return errno;
+
+    // read directory entry
+    if (SPIFFS_readdir(&dir->d, &out) == 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        if (!errno) {
+            *out_dirent = NULL;
         }
-        item_name = (char *)out.name;
-        plen = strlen(dir->path);
-
-    } while ((plen > 1) && (strncasecmp(dir->path, (const char*)out.name, plen) || out.name[plen] != '/' || !out.name[plen + 1]));
-
-    if (plen > 1) {
-        item_name += plen + 1;
-    } else if (item_name[0] == '/') {
-        item_name++;
+        return errno;
     }
+    const char *item_name = (const char *)out.name;
+    const char *out_item_name = (const char *)out.name;
+    size_t plen = strlen(dir->path); // directory path length
+
+    // === skip all entries not belonging to the requested directory path ===
+    if (plen > 1) {
+        // on subdirectory
+        while ((strstr(item_name, dir->path) != item_name) || (strlen(item_name) <= plen) || (strchr(item_name+plen+1, '/'))) {
+            if (SPIFFS_readdir(&dir->d, &out) == 0) {
+                errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+                SPIFFS_clearerr(efs->fs);
+                if (!errno) {
+                    *out_dirent = NULL;
+                }
+                return errno;
+            }
+            item_name = (const char *)out.name;
+        }
+        out_item_name = item_name + plen + 1;
+    }
+    else {
+        // on root
+        while ((strlen(item_name) > 2) && (strchr(item_name+1, '/'))) {
+            if (SPIFFS_readdir(&dir->d, &out) == 0) {
+                errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+                SPIFFS_clearerr(efs->fs);
+                if (!errno) {
+                    *out_dirent = NULL;
+                }
+                return errno;
+            }
+            item_name = (const char *)out.name;
+        }
+        out_item_name = item_name + plen;
+    }
+#ifdef CONFIG_SPIFFS_USE_DIR
+    // Get file stat, used for setting file type in dirent entry
+    spiffs_stat s = {0};
+    off_t ret = SPIFFS_stat(efs->fs, item_name, &s);
+    if (ret < 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        return errno;
+    }
+#endif
+
     entry->d_ino = 0;
+#ifdef CONFIG_SPIFFS_USE_DIR
+    vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+    if (meta->type == SPIFFS_TYPE_DIR) entry->d_type = DT_DIR;
+    else entry->d_type = out.type;
+#else
     entry->d_type = out.type;
-    snprintf(entry->d_name, SPIFFS_OBJ_NAME_LEN, "%s", item_name);
+#endif
+    snprintf(entry->d_name, SPIFFS_OBJ_NAME_LEN, "%s", out_item_name);
     dir->offset++;
     *out_dirent = entry;
     return 0;
@@ -699,14 +821,89 @@ static void vfs_spiffs_seekdir(void* ctx, DIR* pdir, long offset)
 
 static int vfs_spiffs_mkdir(void* ctx, const char* name, mode_t mode)
 {
+#ifdef CONFIG_SPIFFS_USE_DIR
+    assert(name);
+    esp_spiffs_t * efs = (esp_spiffs_t *)ctx;
+
+    int fd = SPIFFS_open(efs->fs, name, SPIFFS_CREAT | SPIFFS_WRONLY, 0);
+    if (fd < 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        return -1;
+    }
+    vfs_spiffs_update_meta(efs->fs, fd, SPIFFS_TYPE_DIR);
+
+    if (SPIFFS_close(efs->fs, fd) < 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        return -1;
+    }
+    return 0;
+#else
     errno = ENOTSUP;
     return -1;
+#endif
 }
 
 static int vfs_spiffs_rmdir(void* ctx, const char* name)
 {
+#ifdef CONFIG_SPIFFS_USE_DIR
+    assert(name);
+    spiffs_stat s;
+    esp_spiffs_t * efs = (esp_spiffs_t *)ctx;
+
+    off_t ret = SPIFFS_stat(efs->fs, name, &s);
+    if (ret < 0) {
+        // Directory name not found
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        // return success, as it is acctualy "removed"
+        return 0;
+    }
+
+    vfs_spiffs_meta_t * meta = (vfs_spiffs_meta_t *)&s.meta;
+    if (meta->type != SPIFFS_TYPE_DIR) {
+        // not a directory
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    // Check if  directory is empty
+    int nument = 0;
+    char npath[SPIFFS_OBJ_NAME_LEN+8];
+    sprintf(npath, efs->base_path);
+    strlcat(npath, name, SPIFFS_OBJ_NAME_LEN);
+    DIR *dir = opendir(npath);
+    if (dir) {
+        struct dirent *ent;
+        // Read directory entries
+        while ((ent = readdir(dir)) != NULL) {
+            nument++;
+        }
+    }
+    else {
+        errno = ENOTDIR;
+        return -1;
+    }
+    closedir(dir);
+
+    if (nument > 0) {
+        // Directory not empty, cannot remove
+        errno = ENOTEMPTY;
+        return -1;
+    }
+
+    int res = SPIFFS_remove(efs->fs, name);
+    if (res < 0) {
+        errno = spiffs_res_to_errno(SPIFFS_errno(efs->fs));
+        SPIFFS_clearerr(efs->fs);
+        return -1;
+    }
+    return res;
+#else
     errno = ENOTSUP;
     return -1;
+#endif
 }
 
 static int vfs_spiffs_link(void* ctx, const char* n1, const char* n2)
@@ -715,30 +912,31 @@ static int vfs_spiffs_link(void* ctx, const char* n1, const char* n2)
     return -1;
 }
 
-static void vfs_spiffs_update_mtime(spiffs *fs, spiffs_file fd)
+static void vfs_spiffs_update_meta(spiffs *fs, spiffs_file fd, uint8_t type)
 {
+#if defined (CONFIG_SPIFFS_USE_MTIME) || defined (CONFIG_SPIFFS_USE_DIR)
+    vfs_spiffs_meta_t meta;
 #ifdef CONFIG_SPIFFS_USE_MTIME
-    time_t t = time(NULL);
-    spiffs_stat s;
-    int ret = SPIFFS_OK;
-    if (CONFIG_SPIFFS_META_LENGTH > sizeof(t)) {
-        ret = SPIFFS_fstat(fs, fd, &s);
-    }
-    if (ret == SPIFFS_OK) {
-        memcpy(s.meta, &t, sizeof(t));
-        ret = SPIFFS_fupdate_meta(fs, fd, s.meta);
-    }
-    if (ret != SPIFFS_OK) {
-        ESP_LOGW(TAG, "Failed to update mtime (%d)", ret);
-    }
+    meta.mtime = time(NULL);
 #endif //CONFIG_SPIFFS_USE_MTIME
+#ifdef CONFIG_SPIFFS_USE_DIR
+    // Add file type (directory or regular file) to the last byte of metadata
+    meta.type = type;
+#endif
+    int ret = SPIFFS_fupdate_meta(fs, fd, (uint8_t *)&meta);
+    if (ret != SPIFFS_OK) {
+        ESP_LOGW(TAG, "Failed to update metadata (%d)", ret);
+    }
+#endif
 }
 
 static time_t vfs_spiffs_get_mtime(const spiffs_stat* s)
 {
     time_t t = 0;
 #ifdef CONFIG_SPIFFS_USE_MTIME
-    memcpy(&t, s->meta, sizeof(t));
+    vfs_spiffs_meta_t meta;
+    memcpy(&meta, s->meta, sizeof(meta));
+    t = meta.mtime;
 #endif
     return t;
 }

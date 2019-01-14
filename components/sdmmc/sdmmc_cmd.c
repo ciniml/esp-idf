@@ -25,6 +25,7 @@
 #include "sdmmc_cmd.h"
 #include "sys/param.h"
 #include "soc/soc_memory_layout.h"
+#include "sdkconfig.h"
 
 #define SDMMC_GO_IDLE_DELAY_MS              20
 #define SDMMC_IO_SEND_OP_COND_DELAY_MS      10
@@ -99,7 +100,7 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config, sdmmc_card_t* card)
         // Check if host flags are compatible with slot configuration.
         sdmmc_fix_host_flags(card);
     }
-    
+
     /* ----------- standard initialization process starts here ---------- */
 
     /* Reset SDIO (CMD52, RES) before re-initializing IO (CMD5). */
@@ -144,7 +145,7 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config, sdmmc_card_t* card)
 
     /* IO_SEND_OP_COND(CMD5), Determine if the card is an IO card.
      * Non-IO cards will not respond to this command.
-     */ 
+     */
     err = sdmmc_io_send_op_cond(card, 0, &card->ocr);
     if (err != ESP_OK) {
         ESP_LOGD(TAG, "%s: io_send_op_cond (1) returned 0x%x; not IO card", __func__, err);
@@ -343,7 +344,7 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config, sdmmc_card_t* card)
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "slot->set_bus_width failed");
                     return err;
-                }                
+                }
             }
         }
     }
@@ -351,8 +352,12 @@ esp_err_t sdmmc_card_init(const sdmmc_host_t* config, sdmmc_card_t* card)
      * clock rate which both host and the card support, and switch to it.
      */
     bool freq_switched = false;
+    #ifdef CONFIG_SDMMC_ALLOW_SPI_HIGHSPEED
+    if (config->max_freq_khz >= SDMMC_FREQ_HIGHSPEED) {
+    #else
     if (config->max_freq_khz >= SDMMC_FREQ_HIGHSPEED &&
             !is_spi /* SPI doesn't support >26MHz in some cases */) {
+    #endif
         if (card->is_mem) {
             err = sdmmc_enable_hs_mode_and_check(card);
         } else {

@@ -137,6 +137,15 @@ static esp_err_t bootloader_main()
     bootloader_clock_configure();
     uart_console_configure();
     wdt_reset_check();
+
+    // LoBo, boot LED handling
+    #if CONFIG_BOOT_SET_LED >= 0
+    gpio_pad_select_gpio(CONFIG_BOOT_SET_LED);
+    if (CONFIG_BOOT_SET_LED < 32) gpio_output_set(CONFIG_BOOT_LED_ON << CONFIG_BOOT_SET_LED, (CONFIG_BOOT_LED_ON ? 0 : 1) << CONFIG_BOOT_SET_LED, 1<<CONFIG_BOOT_SET_LED,0);
+    else gpio_output_set_high(CONFIG_BOOT_LED_ON << (CONFIG_BOOT_SET_LED-32), (CONFIG_BOOT_LED_ON ? 0 : 1) << (CONFIG_BOOT_SET_LED-32), 1<<(CONFIG_BOOT_SET_LED-32),0);
+    ESP_LOGI(TAG, "BOOT LED set to %d", CONFIG_BOOT_LED_ON);
+    #endif
+
     ESP_LOGI(TAG, "ESP-IDF %s 2nd stage bootloader", IDF_VER);
 
     ESP_LOGI(TAG, "compile time " __TIME__ );

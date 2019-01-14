@@ -395,6 +395,8 @@ class Monitor(object):
         # to make a decision.
         if self._last_line_part != b"":
             if self._force_line_print or (finalize_line and self._line_matcher.match(self._last_line_part)):
+                if ord(self._last_line_part[0]) == 13:
+                    self.console.write_bytes(b'\n')
                 self._force_line_print = True;
                 if self._output_enabled:
                     self.console.write_bytes(self._last_line_part)

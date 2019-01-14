@@ -812,6 +812,48 @@ esp_err_t esp_http_client_perform(esp_http_client_handle_t client)
 }
 
 
+esp_err_t esp_http_client_perform_response(esp_http_client_handle_t client)
+{
+    esp_err_t err;
+    if (esp_http_client_fetch_headers(client) < 0) {
+        return ESP_ERR_HTTP_FETCH_HEADER;
+    }
+
+    if ((err = esp_http_check_response(client)) != ESP_OK) {
+        ESP_LOGE(TAG, "Error response");
+        return err;
+    }
+    while (client->response->is_chunked && !client->is_chunk_complete) {
+        if (esp_http_client_get_data(client) <= 0) {
+            ESP_LOGD(TAG, "Read finish or server requests close");
+            break;
+        }
+    }
+    while (client->response->data_process < client->response->content_length) {
+        if (esp_http_client_get_data(client) <= 0) {
+            ESP_LOGD(TAG, "Read finish or server requests close");
+            break;
+        }
+    }
+
+    http_dispatch_event(client, HTTP_EVENT_ON_FINISH, NULL, 0);
+
+    if (!http_should_keep_alive(client->parser)) {
+        ESP_LOGD(TAG, "Close connection");
+        esp_http_client_close(client);
+    } else {
+        if (client->state > HTTP_STATE_CONNECTED) {
+            client->state = HTTP_STATE_CONNECTED;
+        }
+    }
+    return ESP_OK;
+}
+
+int esp_http_client_process_again(esp_http_client_handle_t client)
+{
+    return client->process_again;
+}
+
 int esp_http_client_fetch_headers(esp_http_client_handle_t client)
 {
     if (client->state < HTTP_STATE_REQ_COMPLETE_HEADER) {
