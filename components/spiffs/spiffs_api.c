@@ -55,8 +55,28 @@ s32_t spiffs_api_write(spiffs *fs, uint32_t addr, uint32_t size, uint8_t *src)
 
 s32_t spiffs_api_erase(spiffs *fs, uint32_t addr, uint32_t size)
 {
-    esp_err_t err = esp_partition_erase_range(((esp_spiffs_t *)(fs->user_data))->partition, 
-                                        addr, size);
+    // Check if the sector is already erased
+    uint8_t f = 1;
+    esp_err_t err = 0;
+    uint8_t *buff = heap_caps_malloc(size, MALLOC_CAP_DMA);
+    if (buff) {
+        err = esp_partition_read(((esp_spiffs_t *)(fs->user_data))->partition, addr, buff, size);
+        if (err == ESP_OK) {
+            f = 0;
+            for (int i=0; i<size; i++) {
+                if (buff[i] != 0xFF) {
+                    f = 1;
+                    break;
+                }
+            }
+        }
+        free(buff);
+        err = 0;
+    }
+    if (f) {
+        err = esp_partition_erase_range(((esp_spiffs_t *)(fs->user_data))->partition,
+                                            addr, size);
+    }
     if (err) {
         ESP_LOGE(TAG, "failed to erase addr %08x, size %08x, err %d", addr, size, err);
         return -1;

@@ -104,7 +104,7 @@ void __register_frame_info (const void *begin, struct object *ob);
 extern char __eh_frame[];
 
 //If CONFIG_SPIRAM_IGNORE_NOTFOUND is set and external RAM is not found or errors out on testing, this is set to false.
-static bool s_spiram_okay=true;
+bool s_spiram_okay=true;
 
 /*
  * We arrive here after the bootloader finished loading the program from flash. The hardware is mostly uninitialized,

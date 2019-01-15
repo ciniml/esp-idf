@@ -151,6 +151,8 @@ PACK_STRUCT_END
 #  include "arch/epstruct.h"
 #endif
 
+bool sntp_is_synced = false;
+
 /* function prototypes */
 static void sntp_request(void *arg);
 
@@ -211,6 +213,7 @@ sntp_process(u32_t *receive_timestamp)
   int is_1900_based = ((rx_secs & 0x80000000) != 0);
   u32_t t = is_1900_based ? (rx_secs - DIFF_SEC_1900_1970) : (rx_secs + DIFF_SEC_1970_2036);
   time_t tim = t;
+  sntp_is_synced = true;
 
 #if SNTP_CALC_TIME_US
   u32_t us = ntohl(receive_timestamp[1]) / 4295;

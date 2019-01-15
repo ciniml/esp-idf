@@ -190,12 +190,54 @@ static void log_invalid_app_partition(int index)
     }
 }
 
+/** LoBo
+ *  @function :   ForceFactoryBoot
+ *  @description: Check if boot from Factory partition is requested
+ *                by the pin state defined in menuconfig
+ *
+ *  @inputs:      void
+ */
+//-----------------------------------
+static uint8_t ForceFactoryBoot(void)
+{
+    #if CONFIG_GPIO_INPUT_FORCE_FACTORY
+    uint8_t timer = 0;
+    uint32_t mux_reg = GPIO_PIN_MUX_REG[CONFIG_GPIO_PIN_FORCE_FACTORY];
+    if (mux_reg == 0) return 0;
+
+    gpio_pad_select_gpio(CONFIG_GPIO_PIN_FORCE_FACTORY);
+    //output disable
+    if (CONFIG_GPIO_PIN_FORCE_FACTORY < 32) gpio_output_set(0,0,0, 1<<CONFIG_GPIO_PIN_FORCE_FACTORY);
+    else gpio_output_set_high(0,0,0, 1<<(CONFIG_GPIO_PIN_FORCE_FACTORY-32));
+    // Enable input
+    PIN_INPUT_ENABLE(mux_reg);
+
+    ets_delay_us(10000); //delay 10 msecs
+
+    ESP_LOGW(TAG, "Check force Factory boot Pin %d for level %d [current=%d]",
+             CONFIG_GPIO_PIN_FORCE_FACTORY, CONFIG_GPIO_LEVEL_FORCE_FACTORY, GPIO_INPUT_GET(CONFIG_GPIO_PIN_FORCE_FACTORY));
+    while (GPIO_INPUT_GET(CONFIG_GPIO_PIN_FORCE_FACTORY) == CONFIG_GPIO_LEVEL_FORCE_FACTORY) {
+        if ((timer % 5) == 0) {
+            ESP_LOGE(TAG, "Force Factory boot Pin is Active!");
+        }
+        ets_delay_us(100000); // wait 100 ms
+        timer++;
+        if (timer == 30) {
+            ESP_LOGE(TAG, "Forcing boot to Factory partition");
+            return 1;
+        }
+    }
+    ESP_LOGW(TAG, "Normal boot");
+    #endif
+    return 0;
+}
+
 int bootloader_utility_get_selected_boot_partition(const bootloader_state_t *bs)
 {
     esp_ota_select_entry_t sa,sb;
     const esp_ota_select_entry_t *ota_select_map;
 
-    if (bs->ota_info.offset != 0) {
+    if (bs->ota_info.offset != 0 && !ForceFactoryBoot()) { // LoBo
         // partition table has OTA data partition
         if (bs->ota_info.size < 2 * SPI_SEC_SIZE) {
             ESP_LOGE(TAG, "ota_info partition size %d is too small (minimum %d bytes)", bs->ota_info.size, sizeof(esp_ota_select_entry_t));

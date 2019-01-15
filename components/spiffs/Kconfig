@@ -96,7 +96,8 @@ config SPIFFS_USE_MAGIC_LENGTH
 
 config SPIFFS_META_LENGTH
     int "Size of per-file metadata field"
-    default 4
+    default 5
+    range 0 64
     help
         This option sets the number of extra bytes stored in the file header.
         These bytes can be used in an application-specific manner.
@@ -109,12 +110,23 @@ config SPIFFS_META_LENGTH
 config SPIFFS_USE_MTIME
     bool "Save file modification time"
     default "y"
-    depends on SPIFFS_META_LENGTH >= 4
+    depends on (!SPIFFS_USE_DIR && SPIFFS_META_LENGTH >= 4) || (SPIFFS_USE_DIR && SPIFFS_META_LENGTH >= 5)
     help
         If enabled, then the first 4 bytes of per-file metadata will be used
         to store file modification time (mtime), accessible through
         stat/fstat functions.
         Modification time is updated when the file is opened.
+
+config SPIFFS_USE_DIR
+    bool "Enable directories"
+    default "y"
+    depends on SPIFFS_META_LENGTH >= 1
+    help
+        If enabled, directory support will be enabled in spiffs.
+        Directory create/remove functions will be accessible through
+        mkdir/rmdir functions.
+        One additional byte of per-file metadata will be used
+        to store file the file type (regular file/directory)
 
 menu "Debug Configuration"
 

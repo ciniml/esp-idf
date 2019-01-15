@@ -39,6 +39,8 @@
 extern "C" {
 #endif
 
+extern bool sntp_is_synced;
+
 /* SNTP operating modes: default is to poll using unicast.
    The mode has to be set before calling sntp_init(). */
 #define SNTP_OPMODE_POLL            0
